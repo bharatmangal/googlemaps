@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google Maps Clone</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div class="search-box">
+                <input type="text" id="origin-input" placeholder="Enter starting point" class="place-input">
+                <input type="text" id="destination-input" placeholder="Enter destination" class="place-input">
+                <div class="button-group">
+                    <button onclick="getDirections()">Get Directions</button>
+                    <button onclick="clearRoute()">Clear Route</button>
+                </div>
+            </div>
+            <div class="controls">
+                <button id="locationButton" onclick="getCurrentLocation()">My Location</button>
+                <button id="startNavigation" onclick="toggleNavigation()" class="navigation-button">Start Navigation</button>
+            </div>
+            <div id="navigation-info" class="navigation-info">
+                <div class="next-step">
+                    <div class="step-icon">→</div>
+                    <div class="step-text">Loading...</div>
+                </div>
+                <div class="distance-remaining">Distance remaining: --</div>
+                <div class="time-remaining">Time remaining: --</div>
+            </div>
+            <div id="route-info" class="route-info"></div>
+            <div id="status" class="status"></div>
+            <div class="coordinates">
+                <div>Latitude: <span id="lat">-</span></div>
+                <div>Longitude: <span id="lng">-</span></div>
+                <div>Accuracy: <span id="accuracy">-</span></div>
+            </div>
+        </div>
+        <div id="map"></div>
+    </div>
+
+    <script src="https://maps.googleapis.com/maps/api/js?key={{ maps_api_key }}&libraries=places,geometry&callback=initMap" async defer></script>
+    <script>
+        let map;
+        let marker;
+        let directionsService;
+        let directionsRenderer;
+        let originAutocomplete;
+        let destinationAutocomplete;
+        let statusDiv;
+        let watchId = null;
+        let locationButton;
+        let isTrackingLocation = false;
+        let currentRoute = null;
+        let isNavigating = false;
+        let navigationMarker = null;
+        let currentStep = 0;
+        let remainingDistance = 0;
+        let remainingTime = 0;
+        let lastPosition = null;
+        let navigationBearing = 0;
+
+        function formatCoordinate(coord) {
+            return coord.toFixed(8);
+        }
+
+        function updateCoordinates(lat, lng, accuracy = null) {
+            document.getElementById('lat').textContent = formatCoordinate(lat);
+            document.getElementById('lng').textContent = formatCoordinate(lng);
+            if (accuracy !== null) {
+                document.getElementById('accuracy').textContent = accuracy.toFixed(2) + ' meters';
+            } else {
+                document.getElementById('accuracy').textContent = '-';
+            }
+        }
+
+        function updateStatus(message) {
+            statusDiv = document.getElementById('status');
+            statusDiv.innerHTML = message;
+            console.log(message);
+        }
+
+        function formatDuration(seconds) {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            if (hours > 0) {
+                return `${hours} hr ${minutes} min`;
+            }
+            return `${minutes} min`;
+        }
+
+        function formatDistance(meters) {
+            const km = meters / 1000;
+            if (km >= 1) {
+                return `${km.toFixed(1)} km`;
+            }
+            return `${meters.toFixed(0)} m`;
+        }
+
+        function updateRouteInfo(response) {
+            const route = response.routes[0];
+            const leg = route.legs[0];
+            const routeInfo = document.getElementById('route-info');
+            
+            let html = '<div class="route-summary">';
+            html += `<div class="route-duration">${leg.duration.text}</div>`;
+            html += `<div class="route-distance">${leg.distance.text}</div>`;
+            html += '</div><div class="route-steps">';
+            
+            leg.steps.forEach((step, index) => {
+                html += `<div class="route-step">
+                    <div class="step-number">${index + 1}</div>
+                    <div class="step-instruction">${step.instructions}</div>
+                    <div class="step-distance">${step.distance.text}</div>
+                </div>`;
+            });
+            
+            html += '</div>';
+            routeInfo.innerHTML = html;
+            routeInfo.style.display = 'block';
+        }
+
+        function clearRoute() {
+            if (directionsRenderer) {
+                directionsRenderer.setMap(null);
+                document.getElementById('route-info').style.display = 'none';
+                document.getElementById('origin-input').value = '';
+                document.getElementById('destination-input').value = '';
+                currentRoute = null;
+            }
+        }
+
+        function getDirections() {
+            const origin = document.getElementById('origin-input').value;
+            const destination = document.getElementById('destination-input').value;
+
+            if (!origin || !destination) {
+                updateStatus('Please enter both origin and destination');
+                return;
+            }
+
+            const request = {
+                origin: origin,
+                destination: destination,
+                travelMode: 'DRIVING',
+                provideRouteAlternatives: true
+            };
+
+            directionsService.route(request, (response, status) => {
+                if (status === 'OK') {
+                    directionsRenderer.setMap(map);
+                    directionsRenderer.setDirections(response);
+                    currentRoute = response;
+                    updateRouteInfo(response);
+                    updateStatus('Route found successfully');
+                } else {
+                    updateStatus('Could not find route: ' + status);
+                }
+            });
+        }
+
+        function initMap() {
+            try {
+                // Default location (New York City)
+                const defaultLocation = { lat: 40.71280000, lng: -74.00600000 };
+                
+                map = new google.maps.Map(document.getElementById("map"), {
+                    center: defaultLocation,
+                    zoom: 12,
+                    styles: [
+                        {
+                            featureType: "poi",
+                            elementType: "labels",
+                            stylers: [{ visibility: "off" }]
+                        }
+                    ]
+                });
+
+                // Initialize Directions Service and Renderer
+                directionsService = new google.maps.DirectionsService();
+                directionsRenderer = new google.maps.DirectionsRenderer({
+                    map: null,
+                    suppressMarkers: false,
+                    preserveViewport: false
+                });
+
+                // Initialize Autocomplete for origin and destination
+                originAutocomplete = new google.maps.places.Autocomplete(
+                    document.getElementById('origin-input'),
+                    { types: ['geocode', 'establishment'] }
+                );
+
+                destinationAutocomplete = new google.maps.places.Autocomplete(
+                    document.getElementById('destination-input'),
+                    { types: ['geocode', 'establishment'] }
+                );
+
+                // Bind autocomplete to the map
+                originAutocomplete.bindTo('bounds', map);
+                destinationAutocomplete.bindTo('bounds', map);
+
+                marker = new google.maps.Marker({
+                    map: map,
+                    draggable: true,
+                    position: defaultLocation
+                });
+
+                // Update coordinates for default position
+                updateCoordinates(defaultLocation.lat, defaultLocation.lng);
+
+                // Add marker position update listener
+                marker.addListener('dragend', function() {
+                    const position = marker.getPosition();
+                    const lat = position.lat();
+                    const lng = position.lng();
+                    updateCoordinates(lat, lng);
+                    updateStatus(`Marker position updated to: ${formatCoordinate(lat)}, ${formatCoordinate(lng)}`);
+                });
+
+                // Add click listener to map
+                map.addListener('click', function(e) {
+                    const lat = e.latLng.lat();
+                    const lng = e.latLng.lng();
+                    marker.setPosition(e.latLng);
+                    updateCoordinates(lat, lng);
+                    updateStatus(`Map clicked at: ${formatCoordinate(lat)}, ${formatCoordinate(lng)}`);
+                });
+
+                // Add place_changed listeners for autocomplete
+                originAutocomplete.addListener('place_changed', function() {
+                    const place = originAutocomplete.getPlace();
+                    if (!place.geometry) {
+                        updateStatus('No location found for the entered place');
+                        return;
+                    }
+                    map.setCenter(place.geometry.location);
+                    marker.setPosition(place.geometry.location);
+                });
+
+                destinationAutocomplete.addListener('place_changed', function() {
+                    const place = destinationAutocomplete.getPlace();
+                    if (!place.geometry) {
+                        updateStatus('No location found for the entered place');
+                        return;
+                    }
+                    if (!currentRoute) {
+                        map.setCenter(place.geometry.location);
+                        marker.setPosition(place.geometry.location);
+                    }
+                });
+
+                locationButton = document.getElementById('locationButton');
+                updateStatus('Map initialized successfully');
+            } catch (error) {
+                updateStatus('Error initializing map: ' + error.message);
+            }
+        }
+
+        function stopLocationTracking() {
+            if (watchId !== null) {
+                navigator.geolocation.clearWatch(watchId);
+                watchId = null;
+            }
+            isTrackingLocation = false;
+            locationButton.textContent = 'My Location';
+            updateStatus('Location tracking stopped');
+        }
+
+        function createNavigationMarker(position) {
+            const image = {
+                path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+                scale: 6,
+                fillColor: '#4285F4',
+                fillOpacity: 1,
+                strokeColor: '#FFFFFF',
+                strokeWeight: 2,
+                rotation: navigationBearing
+            };
+
+            if (navigationMarker) {
+                navigationMarker.setMap(null);
+            }
+
+            navigationMarker = new google.maps.Marker({
+                position: position,
+                map: map,
+                icon: image,
+                zIndex: 2
+            });
+        }
+
+        function calculateBearing(start, end) {
+            const startLat = start.lat() * Math.PI / 180;
+            const startLng = start.lng() * Math.PI / 180;
+            const endLat = end.lat() * Math.PI / 180;
+            const endLng = end.lng() * Math.PI / 180;
+
+            const y = Math.sin(endLng - startLng) * Math.cos(endLat);
+            const x = Math.cos(startLat) * Math.sin(endLat) -
+                     Math.sin(startLat) * Math.cos(endLat) * Math.cos(endLng - startLng);
+            const bearing = Math.atan2(y, x) * 180 / Math.PI;
+            return (bearing + 360) % 360;
+        }
+
+        function updateNavigationInfo(position) {
+            if (!currentRoute || !isNavigating) return;
+
+            const currentLatLng = new google.maps.LatLng(position.lat, position.lng);
+            const leg = currentRoute.routes[0].legs[0];
+            const steps = leg.steps;
+
+            // Find the closest step
+            let minDistance = Infinity;
+            let closestStepIndex = 0;
+            
+            steps.forEach((step, index) => {
+                const stepLatLng = step.start_location;
+                const distance = google.maps.geometry.spherical.computeDistanceBetween(
+                    currentLatLng,
+                    stepLatLng
+                );
+                if (distance < minDistance) {
+                    minDistance = distance;
+                    closestStepIndex = index;
+                }
+            });
+
+            // Update current step if changed
+            if (closestStepIndex !== currentStep) {
+                currentStep = closestStepIndex;
+                const nextStep = steps[currentStep];
+                document.querySelector('.step-text').innerHTML = nextStep.instructions;
+                
+                // Calculate bearing to next step
+                navigationBearing = calculateBearing(
+                    currentLatLng,
+                    nextStep.end_location
+                );
+                
+                if (navigationMarker) {
+                    navigationMarker.setIcon({
+                        ...navigationMarker.getIcon(),
+                        rotation: navigationBearing
+                    });
+                }
+            }
+
+            // Calculate remaining distance and time
+            const remainingSteps = steps.slice(currentStep);
+            remainingDistance = remainingSteps.reduce((acc, step) => acc + step.distance.value, 0);
+            remainingTime = remainingSteps.reduce((acc, step) => acc + step.duration.value, 0);
+
+            // Update UI
+            document.querySelector('.distance-remaining').textContent = 
+                `Distance remaining: ${formatDistance(remainingDistance)}`;
+            document.querySelector('.time-remaining').textContent = 
+                `Time remaining: ${formatDuration(remainingTime)}`;
+
+            // Update route if significantly off course
+            if (minDistance > 50) { // 50 meters threshold
+                recalculateRoute(currentLatLng);
+            }
+        }
+
+        function recalculateRoute(currentPosition) {
+            const destination = document.getElementById('destination-input').value;
+            
+            const request = {
+                origin: currentPosition,
+                destination: destination,
+                travelMode: 'DRIVING'
+            };
+
+            directionsService.route(request, (response, status) => {
+                if (status === 'OK') {
+                    currentRoute = response;
+                    directionsRenderer.setDirections(response);
+                    updateRouteInfo(response);
+                }
+            });
+        }
+
+        function toggleNavigation() {
+            const button = document.getElementById('startNavigation');
+            
+            if (!currentRoute) {
+                updateStatus('Please get directions first before starting navigation');
+                return;
+            }
+
+            if (!isNavigating) {
+                // Start navigation
+                isNavigating = true;
+                button.textContent = 'Stop Navigation';
+                button.classList.add('navigating');
+                document.getElementById('navigation-info').style.display = 'block';
+                
+                // Start location tracking if not already tracking
+                if (!isTrackingLocation) {
+                    getCurrentLocation();
+                }
+            } else {
+                // Stop navigation
+                isNavigating = false;
+                button.textContent = 'Start Navigation';
+                button.classList.remove('navigating');
+                document.getElementById('navigation-info').style.display = 'none';
+                
+                if (navigationMarker) {
+                    navigationMarker.setMap(null);
+                    navigationMarker = null;
+                }
+            }
+        }
+
+        function getCurrentLocation() {
+            if (isTrackingLocation) {
+                stopLocationTracking();
+                return;
+            }
+
+            if (!navigator.geolocation) {
+                updateStatus('Error: Your browser doesn\'t support geolocation');
+                return;
+            }
+
+            locationButton.textContent = 'Stop Tracking';
+            isTrackingLocation = true;
+            updateStatus('Requesting your current location...');
+
+            const options = {
+                enableHighAccuracy: true,
+                timeout: 30000,
+                maximumAge: 0
+            };
+
+            watchId = navigator.geolocation.watchPosition(
+                (position) => {
+                    const lat = position.coords.latitude;
+                    const lng = position.coords.longitude;
+                    const accuracy = position.coords.accuracy;
+                    const pos = { lat, lng };
+
+                    if (accuracy > 100) {
+                        updateStatus(`Warning: Low location accuracy (${accuracy.toFixed(2)} meters). Try moving to an open area.`);
+                        return;
+                    }
+
+                    if (isNavigating) {
+                        // Update navigation marker
+                        createNavigationMarker(pos);
+                        updateNavigationInfo(pos);
+                        
+                        // Center map on user's location during navigation
+                        map.setCenter(pos);
+                        
+                        // Adjust zoom based on speed and accuracy
+                        const zoomLevel = Math.min(20, Math.max(16, Math.floor(20 - Math.log2(accuracy))));
+                        map.setZoom(zoomLevel);
+                    } else {
+                        // Normal location tracking behavior
+                        map.setCenter(pos);
+                        marker.setPosition(pos);
+                        const zoomLevel = Math.min(20, Math.max(15, Math.floor(20 - Math.log2(accuracy))));
+                        map.setZoom(zoomLevel);
+                    }
+
+                    updateCoordinates(lat, lng, accuracy);
+                    lastPosition = pos;
+                },
+                (error) => {
+                    let errorMessage = 'Geolocation failed: ';
+                    switch(error.code) {
+                        case error.PERMISSION_DENIED:
+                            errorMessage += "Permission denied. Please enable location services in your browser settings.";
+                            break;
+                        case error.POSITION_UNAVAILABLE:
+                            errorMessage += "Position unavailable. Try moving to an area with better GPS signal.";
+                            break;
+                        case error.TIMEOUT:
+                            errorMessage += "Request timed out. Please try again.";
+                            break;
+                        default:
+                            errorMessage += "Unknown error. Please try again.";
+                    }
+                    updateStatus(errorMessage);
+                    stopLocationTracking();
+                },
+                options
+            );
+        }
+    </script>
+</body>
+</html> 
